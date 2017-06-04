@@ -6,6 +6,7 @@ const async = require('async');
 const expect = require('chai').expect;
 const mongoose = require('mongoose');
 const crypto = require('crypto');
+const errors = require('storj-service-error-types');
 
 require('mongoose-types').loadTypes(mongoose);
 
@@ -104,6 +105,133 @@ describe('Storage/models/Frame', function() {
 
   });
 
+  describe('#validShardSizes', function() {
+    it('return true (small single shard)', function() {
+      const shards = [
+        {
+          size: 1024
+        }
+      ];
+      expect(Frame.validShardSizes(shards)).to.equal(true);
+    });
+
+    it('return true (several 2MiB shards)', function() {
+      const shards = [
+        {
+          size: 2097152
+        },
+        {
+          size: 2097152
+        },
+        {
+          size: 2097152
+        }
+      ];
+      expect(Frame.validShardSizes(shards)).to.equal(true);
+    });
+
+    it('return true (several 2MiB shards with small last shard)', function() {
+      const shards = [
+        {
+          size: 2097152
+        },
+        {
+          size: 2097152
+        },
+        {
+          size: 2097152
+        },
+        {
+          size: 1024
+        }
+      ];
+      expect(Frame.validShardSizes(shards)).to.equal(true);
+    });
+
+    it('return true (2MiB, small last shard, w/ parity shards)', function() {
+      const shards = [
+        {
+          size: 2097152
+        },
+        {
+          size: 2097152
+        },
+        {
+          size: 2097152
+        },
+        {
+          size: 1024
+        },
+        {
+          size: 2097152,
+          parity: true
+        },
+        {
+          size: 2097152,
+          parity: true
+        }
+      ];
+      expect(Frame.validShardSizes(shards)).to.equal(true);
+    });
+
+    it('return false (5KiB shards)', function() {
+      const shards = [
+        {
+          size: 5120
+        },
+        {
+          size: 5120
+        },
+        {
+          size: 5120
+        },
+        {
+          size: 5120
+        }
+      ];
+      expect(Frame.validShardSizes(shards)).to.equal(false);
+    });
+
+    it('return false (various size shards)', function() {
+      const shards = [
+        {
+          size: 5120
+        },
+        {
+          size: 3072
+        },
+        {
+          size: 4096
+        }
+      ];
+      expect(Frame.validShardSizes(shards)).to.equal(false);
+    });
+
+    it('return false (various size parity shards)', function() {
+      const shards = [
+        {
+          size: 5120
+        },
+        {
+          size: 5120
+        },
+        {
+          size: 3072
+        },
+        {
+          size: 23552,
+          parity: true
+        },
+        {
+          size: 2048,
+          parity: true
+        }
+      ];
+      expect(Frame.validShardSizes(shards)).to.equal(false);
+    });
+
+  });
+
   describe('#addShard', function() {
     it('will increment sizes with concurrency', function(done) {
       const replacementHash = crypto.randomBytes(20).toString('hex');
@@ -190,6 +318,79 @@ describe('Storage/models/Frame', function() {
           }
           done();
         });
+      });
+    });
+
+    it('will fail if there are multiple shards under the min', function(done) {
+      const replacementHash = crypto.randomBytes(20).toString('hex');
+      let hashes = [];
+      var frame = null;
+
+      function createFrame(next) {
+        Frame.create({}, (err, _frame) => {
+          if (err) {
+            return next(err);
+          }
+          frame = _frame;
+          next();
+        });
+      }
+
+      function addShards(finished) {
+        async.times(3, (n, next) => {
+          let hash = crypto.randomBytes(20).toString('hex');
+          hashes.push(hash);
+          var shard = {
+            index: n,
+            hash: hash,
+            size: 1024,
+            tree: ['tree1', 'tree2'],
+            challenges: ['challenge1', 'challenge2'],
+            parity: n > 6 ? true : false
+          };
+          Pointer.create(shard, function(err, pointer) {
+            if (err) {
+              return next(err);
+            }
+
+            frame.addShard(pointer, next);
+          });
+        }, finished);
+      }
+
+      function replaceShard(next) {
+        Frame.findOne({
+          _id: frame._id
+        }).populate('shards').exec((err, _frame) => {
+          if (err) {
+            return done(err);
+          }
+          frame = _frame;
+          var shard = {
+            index: 2,
+            hash: replacementHash,
+            size: 1024,
+            tree: ['tree1', 'tree2'],
+            challenges: ['challenge1', 'challenge2'],
+            parity: false
+          };
+          Pointer.create(shard, function(err, pointer) {
+            if (err) {
+              return next(err);
+            }
+            frame.addShard(pointer, next);
+          });
+        });
+      }
+
+      async.series([
+        createFrame,
+        addShards,
+        replaceShard
+      ], (err) => {
+        expect(err).to.be.instanceOf(errors.BadRequestError);
+        expect(err.message).to.equal('Invalid shard sizes');
+        done();
       });
     });
   });
